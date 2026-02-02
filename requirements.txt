@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-dotenv
+phpserialize
+xai_sdk
+openai
+instructor
+mysql-connector-python

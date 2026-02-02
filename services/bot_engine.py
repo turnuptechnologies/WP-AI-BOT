@@ -1,61 +1,15 @@
-"""
-wp_vessel_bot.py
-
-Deterministic answers from WordPress usermeta:
-- meta_key: cs_vessel_data
-- meta_value: PHP serialized string (a:...{...})
-
-What it returns (example):
-- vessel
-- status (Found / Not Found)
-- open_defects
-- low / medium / high / unknown  (based on priority_rating)
-- total_records (how many observations found for that vessel)
-- latest_inspection_date (best-effort)
-
-Install:
-  pip install phpserialize
-
-Env:
-  XAI_API_KEY or GROK_API_KEY (only needed if you keep FORMAT_WITH_AI=True)
-
-Run:
-  python wp_vessel_bot.py 15 "Only give me Earth Clipper status and defects count with status."
-"""
-
 from __future__ import annotations
 
-import json
-import os
-import re
-import sys
-from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, Optional, List
 
-import phpserialize  # pip install phpserialize
+from services.user_data import get_all_user_data
+from services.funnel_store import load_funnel, save_funnel, is_stale
+from services.defects_exact import compute_exact_open_defects
 
-# If you want AI formatting (optional)
-FORMAT_WITH_AI = False
-MODEL = "grok-4-fast"
-
-if FORMAT_WITH_AI:
-    from xai_sdk import Client
-    from xai_sdk.chat import system, user
-    API_KEY = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
-    if not API_KEY:
-        raise ValueError("Missing XAI_API_KEY / GROK_API_KEY")
-    client = Client(api_key=API_KEY)
-
-# Your working function
-from services.user_data import get_all_user_data  # ✅
-
-
-# ----------------------------
-# Utilities
-# ----------------------------
 
 def json_safe(obj: Any) -> Any:
-    if isinstance(obj, (datetime, date)):
+    if isinstance(obj, datetime):
         return obj.isoformat()
     if isinstance(obj, dict):
         return {k: json_safe(v) for k, v in obj.items()}
@@ -75,295 +29,232 @@ def _to_str(x: Any) -> str:
     return str(x)
 
 
-def _normalize_name(s: str) -> str:
-    """
-    Normalize vessel names so small differences don't break matching.
-    - lowercase
-    - strip
-    - collapse spaces
-    - remove common punctuation
-    """
-    s = s.lower().strip()
-    s = re.sub(r"[\-_]+", " ", s)
-    s = re.sub(r"[^\w\s]", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def _norm(s: str) -> str:
+    return _to_str(s).strip().lower()
 
 
-def deserialize_php_meta(meta_value: str) -> Any:
+def _find_table_rows(data: Dict[str, Any], suffix: str) -> List[Dict[str, Any]]:
     """
-    Converts PHP serialized string into Python structures.
+    WordPress tables can be: wp_users, wp168_users, mwi_wp_users, etc.
+    We find the FIRST key that endswith suffix and looks like list[dict].
     """
-    if not meta_value or not isinstance(meta_value, str):
-        return None
-    try:
-        raw = phpserialize.loads(meta_value.encode("utf-8"), decode_strings=True)
-        return raw
-    except Exception:
-        return None
+    for k, v in data.items():
+        if k.endswith(suffix) and isinstance(v, list) and (len(v) == 0 or isinstance(v[0], dict)):
+            return v
+    return []
 
 
-def find_cs_vessel_meta(user_data: Any) -> Optional[str]:
+def extract_cs_vessel_meta(user_data: Dict[str, Any]) -> Optional[str]:
     """
-    Your get_all_user_data(user_id) seems to return usermeta rows like:
-    {
-      "umeta_id": ...,
-      "meta_key": "cs_vessel_data",
-      "meta_value": "a:..."
+    Find cs_vessel_data meta_value from any meta table we already loaded
+    (usermeta/postmeta) included in get_all_user_data().
+    """
+    for _, rows in user_data.items():
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("meta_key") == "cs_vessel_data":
+                mv = row.get("meta_value")
+                if mv:
+                    return _to_str(mv)
+    return None
+
+
+def build_user_funnel(user_id: int) -> Dict[str, Any]:
+    raw = json_safe(get_all_user_data(user_id))
+
+    funnel: Dict[str, Any] = {
+        "user_id": user_id,
+        "profile": {},
+        "content_index": [],
+        "meta_index": {},
+        "computed_indexes": {},
+        "last_sync": datetime.utcnow().isoformat() + "Z",
     }
 
-    This function tries to find that row anywhere in user_data.
-    """
-    # Common patterns: user_data might be dict with "usermeta" or "meta" or list
-    if isinstance(user_data, dict):
-        # direct
-        if user_data.get("meta_key") == "cs_vessel_data":
-            return user_data.get("meta_value")
-
-        # scan possible containers
-        for key in ["usermeta", "user_meta", "meta", "metadata", "rows", "data"]:
-            val = user_data.get(key)
-            if isinstance(val, list):
-                for row in val:
-                    if isinstance(row, dict) and row.get("meta_key") == "cs_vessel_data":
-                        return row.get("meta_value")
-
-        # fallback: deep scan dict values that are lists of dicts
-        for v in user_data.values():
-            if isinstance(v, list):
-                for row in v:
-                    if isinstance(row, dict) and row.get("meta_key") == "cs_vessel_data":
-                        return row.get("meta_value")
-
-    if isinstance(user_data, list):
-        for row in user_data:
-            if isinstance(row, dict) and row.get("meta_key") == "cs_vessel_data":
-                return row.get("meta_value")
-    return None
-
-
-def extract_available_vessel_names(cs_data: Any) -> List[str]:
-    """
-    cs_data is typically a dict-like structure (from phpserialize).
-    It looks like: {0: {...}, 1: {...}, ...}
-    Each item has vessel_name.
-    """
-    names = set()
-
-    if isinstance(cs_data, dict):
-        for _, item in cs_data.items():
-            if isinstance(item, dict):
-                vn = item.get("vessel_name") or item.get("vessel")
-                vn = _to_str(vn).strip()
-                if vn:
-                    names.add(vn)
-
-    return sorted(names)
-
-
-def detect_vessel_name_from_question(question: str, available_names: List[str], default_name: str = "") -> str:
-    """
-    Best effort:
-    - If any available vessel name appears in question (normalized contains), use it.
-    - Else, use default_name if provided.
-    """
-    qn = _normalize_name(question)
-    scored: List[Tuple[int, str]] = []
-
-    for name in available_names:
-        nn = _normalize_name(name)
-        if not nn:
-            continue
-        if nn in qn:
-            scored.append((len(nn), name))  # longer match wins
-
-    if scored:
-        scored.sort(reverse=True)
-        return scored[0][1]
-
-    return default_name
-
-
-def parse_inspection_date(s: str) -> Optional[datetime]:
-    """
-    Your sample shows: 18/01/2026 (DD/MM/YYYY)
-    """
-    s = s.strip()
-    if not s:
-        return None
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            pass
-    return None
-
-
-def compute_defect_summary(cs_data: Any, vessel_name: str) -> Dict[str, Any]:
-    """
-    Filters all observations for a vessel_name and computes:
-    - open_defects
-    - priority buckets (low/medium/high/unknown) based on priority_rating
-    - latest inspection date
-    """
-    target = _normalize_name(vessel_name)
-    if not target:
-        return {
-            "vessel": vessel_name,
-            "status": "Not Found",
-            "open_defects": 0,
-            "low": 0,
-            "medium": 0,
-            "high": 0,
-            "unknown": 0,
-            "total_records": 0,
-            "latest_inspection_date": None,
+    # -------------------------
+    # Profile (dynamic users table)
+    # -------------------------
+    users_rows = _find_table_rows(raw, "users")
+    if users_rows:
+        u = users_rows[0]
+        funnel["profile"] = {
+            "ID": u.get("ID"),
+            "username": u.get("user_login"),
+            "email": u.get("user_email"),
+            "display_name": u.get("display_name"),
+            "registered": u.get("user_registered"),
         }
 
-    open_defects = 0
-    low = medium = high = unknown = 0
-    total = 0
-    latest_date: Optional[datetime] = None
-    found_any = False
-
-    if isinstance(cs_data, dict):
-        for _, item in cs_data.items():
-            if not isinstance(item, dict):
-                continue
-
-            vn = _to_str(item.get("vessel_name") or "").strip()
-            if _normalize_name(vn) != target:
-                continue
-
-            found_any = True
-            total += 1
-
-            obs = item.get("observation_data") or {}
-            if not isinstance(obs, dict):
-                obs = {}
-
-            status = _to_str(obs.get("defects_status") or "").strip().lower()
-            if status == "open":
-                open_defects += 1
-
-            pr = _to_str(obs.get("priority_rating") or "").strip()
-            # Common mapping: 1=low, 2=medium, 3=high (adjust if your business rules differ)
-            if pr == "1":
-                low += 1
-            elif pr == "2":
-                medium += 1
-            elif pr == "3":
-                high += 1
-            else:
-                unknown += 1
-
-            d = parse_inspection_date(_to_str(obs.get("inspection_date") or ""))
-            if d and (latest_date is None or d > latest_date):
-                latest_date = d
-
-    return {
-        "vessel": vessel_name,
-        "status": "Found" if found_any else "Not Found",
-        "open_defects": open_defects,
-        "low": low,
-        "medium": medium,
-        "high": high,
-        "unknown": unknown,
-        "total_records": total,
-        "latest_inspection_date": latest_date.date().isoformat() if latest_date else None,
-    }
-
-
-def format_answer(payload: Dict[str, Any], question: str) -> str:
-    """
-    Option A: No AI formatting (recommended for accuracy)
-    Option B: AI formatting only (temp=0)
-    """
-    if not FORMAT_WITH_AI:
-        return (
-            f"Vessel: {payload['vessel']}\n"
-            f"Status: {payload['status']}\n"
-            f"Open defects: {payload['open_defects']}\n"
-            f"Low: {payload['low']} | Medium: {payload['medium']} | High: {payload['high']} | Unknown: {payload['unknown']}\n"
+    # -------------------------
+    # Content index (dynamic posts table)
+    # -------------------------
+    posts_rows = _find_table_rows(raw, "posts")
+    for p in posts_rows:
+        if not isinstance(p, dict):
+            continue
+        funnel["content_index"].append(
+            {
+                "id": p.get("ID"),
+                "title": p.get("post_title"),
+                "type": p.get("post_type"),
+                "date": p.get("post_date"),
+                "status": p.get("post_status"),
+            }
         )
 
-    # AI formatting only
-    prompt = f"""
-Format the vessel summary for the user. Do not add, guess, or modify values.
+    # -------------------------
+    # Meta index
+    # -------------------------
+    meta_keys = set()
+    for rows in raw.values():
+        if isinstance(rows, list):
+            for r in rows:
+                if isinstance(r, dict) and "meta_key" in r:
+                    meta_keys.add(_to_str(r.get("meta_key")))
 
-USER QUESTION:
-{question}
+    funnel["meta_index"] = {
+        "important_keys": sorted(list(meta_keys)),
+        "cs_vessel_data_exists": "cs_vessel_data" in meta_keys,
+    }
 
-DATA:
-{json.dumps(payload, indent=2)}
-""".strip()
+    # -------------------------
+    # Exact defect computation (SAFE)
+    # -------------------------
+    open_count = 0
+    open_hours = 0.0
 
-    chat = client.chat.create(model=MODEL, temperature=0)
-    chat.append(system("Format only. No hallucination. Output plain text."))
-    chat.append(user(prompt))
-    response = chat.sample()
-    return (response.content or "").strip()
+    cs_meta = extract_cs_vessel_meta(raw)
+    if cs_meta:
+        exact = compute_exact_open_defects(cs_meta)  # returns ok True/False
+        if isinstance(exact, dict) and exact.get("ok") is True:
+            open_count = int(exact.get("open_defects_count") or 0)
+            open_hours = float(exact.get("open_defect_hours") or 0.0)
+        else:
+            # Keep 0s; store error for debugging
+            funnel["computed_indexes"]["cs_error"] = exact.get("error") if isinstance(exact, dict) else "unknown error"
+    else:
+        funnel["computed_indexes"]["cs_error"] = "cs_vessel_data not found"
+
+    funnel["computed_indexes"]["open_defects_count"] = open_count
+    funnel["computed_indexes"]["open_defect_hours"] = open_hours
+
+    return funnel
 
 
-def generate_bot_response(user_id: int, question: str, default_vessel: str = "") -> Dict[str, Any]:
-    # 1) Get user data
-    user_data = json_safe(get_all_user_data(user_id))
+def detect_intent(question: str) -> str:
+    q = _norm(question)
 
-    # 2) Extract cs_vessel_data meta_value
-    meta_value = find_cs_vessel_meta(user_data)
-    if not meta_value:
-        payload = {
-            "vessel": default_vessel or "Unknown",
-            "status": "cs_vessel_data Not Found",
-            "open_defects": 0,
-            "low": 0,
-            "medium": 0,
-            "high": 0,
-            "unknown": 0,
-            "total_records": 0,
-            "latest_inspection_date": None,
+    if "profile" in q or "account" in q or "my details" in q:
+        return "profile_summary"
+
+    if "defect" in q or "corrosion" in q:
+        return "defects_overview"
+
+    if "hour" in q or "hours" in q:
+        return "defect_hours"
+
+    return "general_query"
+
+
+def generate_bot_response(user_id: int, question: str) -> Dict[str, Any]:
+    funnel = load_funnel(user_id)
+
+    if funnel is None or is_stale(funnel):
+        funnel = build_user_funnel(user_id)
+        save_funnel(user_id, funnel)
+
+    intent = detect_intent(question)
+
+    # -------------------------
+    # PROFILE
+    # -------------------------
+    if intent == "profile_summary":
+        p = funnel.get("profile", {}) or {}
+        return {
+            "ok": True,
+            "intent": intent,
+            "answer": (
+                f"Here are your profile details:\n\n"
+                f"- Name: {p.get('display_name') or ''}\n"
+                f"- Username: {p.get('username') or ''}\n"
+                f"- Email: {p.get('email') or ''}\n"
+                f"- Registered: {p.get('registered') or ''}"
+            ),
+            "data": p,
+            "user_funnel": funnel,
         }
-        return {"question": question, "answer": format_answer(payload, question), "raw_data": payload}
 
-    # 3) Deserialize PHP
-    cs_data = deserialize_php_meta(meta_value)
-    if cs_data is None:
-        payload = {
-            "vessel": default_vessel or "Unknown",
-            "status": "Invalid PHP Serialized Data",
-            "open_defects": 0,
-            "low": 0,
-            "medium": 0,
-            "high": 0,
-            "unknown": 0,
-            "total_records": 0,
-            "latest_inspection_date": None,
+    # -------------------------
+    # DEFECT OVERVIEW (EXACT)
+    # -------------------------
+    if intent == "defects_overview":
+        stats = funnel.get("computed_indexes", {}) or {}
+        open_count = int(stats.get("open_defects_count") or 0)
+        open_hours = float(stats.get("open_defect_hours") or 0.0)
+
+        if open_count == 0 and stats.get("cs_error"):
+            return {
+                "ok": True,
+                "intent": intent,
+                "answer": (
+                    "I couldn't compute your defects from cs_vessel_data yet. "
+                    f"Reason: {stats.get('cs_error')}"
+                ),
+                "data": stats,
+                "user_funnel": funnel,
+            }
+
+        return {
+            "ok": True,
+            "intent": intent,
+            "answer": (
+                f"You currently have **{open_count} open defects** "
+                f"with a total of **{open_hours:g} open defect hours**."
+            ),
+            "data": {
+                "open_defects_count": open_count,
+                "open_defect_hours": open_hours,
+            },
+            "user_funnel": funnel,
         }
-        return {"question": question, "answer": format_answer(payload, question), "raw_data": payload}
 
-    # 4) Detect vessel name
-    available_names = extract_available_vessel_names(cs_data)
-    vessel_name = detect_vessel_name_from_question(question, available_names, default_name=default_vessel)
+    # -------------------------
+    # DEFECT HOURS (EXACT)
+    # -------------------------
+    if intent == "defect_hours":
+        stats = funnel.get("computed_indexes", {}) or {}
+        open_hours = float(stats.get("open_defect_hours") or 0.0)
 
-    # 5) Compute summary deterministically
-    payload = compute_defect_summary(cs_data, vessel_name)
+        if open_hours == 0 and stats.get("cs_error"):
+            return {
+                "ok": True,
+                "intent": intent,
+                "answer": f"I couldn't compute hours yet. Reason: {stats.get('cs_error')}",
+                "data": stats,
+                "user_funnel": funnel,
+            }
 
-    # 6) Format answer
-    answer_text = format_answer(payload, question)
+        return {
+            "ok": True,
+            "intent": intent,
+            "answer": f"The total open defect work hours are **{open_hours:g} hours**.",
+            "data": {"open_defect_hours": open_hours},
+            "user_funnel": funnel,
+        }
 
-    return {"question": question, "answer": answer_text, "raw_data": payload}
-
-
-# ----------------------------
-# CLI
-# ----------------------------
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python wp_vessel_bot.py <user_id> <question>")
-        sys.exit(1)
-
-    uid = int(sys.argv[1])
-    q = " ".join(sys.argv[2:])
-
-    result = generate_bot_response(uid, q, default_vessel="Earth Clipper")
-    print(json.dumps(result, indent=2))
+    # -------------------------
+    # FALLBACK
+    # -------------------------
+    return {
+        "ok": True,
+        "intent": intent,
+        "answer": (
+            "I’ve synced your account data. Ask me about your profile, defects, "
+            "open defect hours, vessels, or reports."
+        ),
+        "data": {},
+        "user_funnel": funnel,
+    }
